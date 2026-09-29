@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Tile a GROMACS system with `gmx genconf -nbox` and rebuild the topology and index.
+
+`gmx genconf -nbox NX NY NZ` writes NX*NY*NZ back-to-back copies of the whole input
+system: [copy 1: peptide, lipids, water, ions][copy 2: peptide, lipids, ...] ...
+A topology whose [ molecules ] counts are simply multiplied by 9 does NOT match that
+atom order, and grompp will fail (or, worse, silently mis-assign parameters when atom
+names happen to line up). An index file from the original system only covers copy 1.
+
+This script:
+  1. runs `gmx genconf` (or takes an already tiled .gro),
+  2. checks the tiled file is N exact copies of the original,
+  3. writes the coordinates in the requested molecule order
+       grouped (default): every [ molecules ] block gathered across copies, so each
+                          count is multiplied by N (e.g. PROA 9, POPC 1152, ...)
+       copy:              genconf order kept, the [ molecules ] list repeated N times
+  4. writes the topology with a matching [ molecules ] section,
+  5. writes an index file where every original group covers all N copies.
+
+Only the Python standard library is needed.
+"""
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+# ----------------------------------------------------------------------------- gro
+
+
+class Gro:
+    def __init__(self, title, atom_lines, box_line):
+        self.title = title
+        self.atom_lines = atom_lines
+        self.box_line = box_line
+
+    @property
+    def natoms(self):
+        return len(self.atom_lines)
+
+    def resid(self, i):
+        return self.atom_lines[i][0:5].strip()
+
+    def resname(self, i):
+        return self.atom_lines[i][5:10].strip()
+
+    def atomname(self, i):
+        return self.atom_lines[i][10:15].strip()
+
+
+def read_gro(path):
+    with open(path) as f:
+        lines = f.read().splitlines()
+    if len(lines) < 3:
+        sys.exit(f"error: {path} is not a valid .gro file")
+    natoms = int(lines[1].split()[0])
+    if len(lines) < natoms + 3:
+        sys.exit(f"error: {path} declares {natoms} atoms but is truncated")
+    return Gro(lines[0], lines[2:2 + natoms], lines[2 + natoms])
+
+
+def write_gro(path, title, atom_lines, box_line, residue_breaks=()):
+    """Write atoms, renumbering residues and atoms sequentially (wrapping at 100000).
+
+    A new residue starts where the residue number/name changes or at any position in
+    residue_breaks (the start of each copied block).
+    """
+    out = [title, f"{len(atom_lines):5d}"]
+    resnr = 0
+    prev_key = None
+    for n, line in enumerate(atom_lines):
+        key = (line[0:5], line[5:10])
+        if key != prev_key or n in residue_breaks:
+            resnr += 1
+        prev_key = key
+        out.append(f"{resnr % 100000:5d}{line[5:15]}{(n + 1) % 100000:5d}{line[20:]}")
+    out.append(box_line)
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+
+
+# ----------------------------------------------------------------------------- topology
+
+DIRECTIVE = re.compile(r"^\s*\[\s*([A-Za-z_]+)\s*\]")
+INCLUDE = re.compile(r'^\s*#include\s+["<](.+?)[">]')
+
+
+def strip_comment(line):
+    return line.split(";", 1)[0].strip()
+
+
+def include_dirs(top_path, extra):
+    dirs = [os.path.dirname(os.path.abspath(top_path))] + list(extra)
+    for env in ("GMXLIB",):
+        if os.environ.get(env):
+            dirs += os.environ[env].split(os.pathsep)
+    if os.environ.get("GMXDATA"):
+        dirs.append(os.path.join(os.environ["GMXDATA"], "top"))
+    return dirs
+
+
+def scan_moleculetypes(path, dirs, found, visited, unresolved):
+    """Collect {moleculetype: [atom names]} from path and everything it #includes."""
+    path = os.path.abspath(path)
+    if path in visited:
+        return
+    visited.add(path)
+    here = os.path.dirname(path)
+    section = None
+    current = None
+    with open(path) as f:
+        for raw in f:
+            inc = INCLUDE.match(raw)
+            if inc:
+                name = inc.group(1)
+                for d in [here] + dirs:
+                    cand = os.path.join(d, name)
+                    if os.path.isfile(cand):
+                        scan_moleculetypes(cand, dirs, found, visited, unresolved)
+                        break
+                else:
+                    unresolved.add(name)
+                continue
+            line = strip_comment(raw)
+            if not line or line.startswith("#"):
+                continue
+            m = DIRECTIVE.match(line)
+            if m:
+                section = m.group(1).lower()
+                continue
+            if section == "moleculetype":
+                current = line.split()[0]
+                found[current] = []
+                section = "moleculetype_done"
+            elif section == "atoms" and current is not None:
+                fields = line.split()
+                if len(fields) >= 5:
+                    found[current].append(fields[4])
+
+
+def split_top(top_path):
+    """Return (lines before [ molecules ], molecule entries, lines after the entries)."""
+    with open(top_path) as f:
+        lines = f.read().splitlines()
+    start = None
+    for i, raw in enumerate(lines):
+        m = DIRECTIVE.match(strip_comment(raw))
+        if m and m.group(1).lower() == "molecules":
+            start = i
+    if start is None:
+        sys.exit(f"error: no [ molecules ] section in {top_path} (it must be in the main .top)")
+    entries = []
+    end = start + 1
+    while end < len(lines):
+        line = strip_comment(lines[end])
+        if DIRECTIVE.match(line):
+            break
+        if line and not line.startswith("#"):
+            name, count = line.split()[:2]
+            entries.append((name, int(count)))
+        end += 1
+    return lines[:start + 1], entries, lines[end:]
+
+
+def molecule_blocks(gro, entries, moltypes):
+    """Split the original system into [ molecules ] blocks: (name, count, start, size)."""
+    blocks = []
+    pos = 0
+    for name, count in entries:
+        names = moltypes.get(name)
+        if names:
+            per_mol = len(names)
+        else:
+            # Moleculetype not readable (e.g. water from a force-field dir that is not on
+            # the include path): assume one residue per molecule, as for water/ions/lipids.
+            if pos >= gro.natoms:
+                sys.exit(f"error: [ molecules ] lists more atoms than the .gro ({name})")
+            per_mol = 1
+            while (pos + per_mol < gro.natoms
+                   and gro.resid(pos + per_mol) == gro.resid(pos)
+                   and gro.resname(pos + per_mol) == gro.resname(pos)):
+                per_mol += 1
+            print(f"note: moleculetype {name} not found in the included .itp files; "
+                  f"using {per_mol} atoms/molecule from residue {gro.resname(pos)} in the .gro")
+        size = per_mol * count
+        if pos + size > gro.natoms:
+            sys.exit(f"error: [ molecules ] needs more atoms than the {gro.natoms} in the .gro "
+                     f"(ran out at {name})")
+        if names:
+            got = [gro.atomname(pos + k) for k in range(per_mol)]
+            if got != names:
+                print(f"warning: first {name} molecule in the .gro has atom names that differ "
+                      f"from its .itp; check the [ molecules ] order")
+        blocks.append((name, count, pos, size))
+        pos += size
+    if pos != gro.natoms:
+        sys.exit(f"error: [ molecules ] accounts for {pos} atoms but the .gro has {gro.natoms}")
+    return blocks
+
+
+# ----------------------------------------------------------------------------- index
+
+
+def read_ndx(path):
+    groups = []
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.match(r"^\[\s*(.+?)\s*\]$", line)
+            if m:
+                groups.append((m.group(1), []))
+            elif groups:
+                groups[-1][1].extend(int(x) for x in line.split())
+    return groups
+
+
+def write_ndx(path, groups):
+    with open(path, "w") as f:
+        for name, atoms in groups:
+            f.write(f"[ {name} ]\n")
+            for k in range(0, len(atoms), 15):
+                f.write(" ".join(f"{a:>6d}" for a in atoms[k:k + 15]) + "\n")
+            f.write("\n")
+
+
+# ----------------------------------------------------------------------------- main
+
+
+def run_genconf(gmx, gro, nbox, out):
+    cmd = shlex.split(gmx) + ["genconf", "-f", gro, "-o", out, "-nbox"] + [str(n) for n in nbox]
+    print("running:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--gro", required=True, help="original (untiled) coordinates, .gro")
+    p.add_argument("--top", required=True, help="original topology, .top")
+    p.add_argument("--ndx", help="original index file (optional)")
+    p.add_argument("--nbox", nargs=3, type=int, default=[3, 3, 1], metavar=("NX", "NY", "NZ"),
+                   help="number of copies in x y z (default: 3 3 1; do not tile a bilayer in z)")
+    p.add_argument("--tiled-gro", help="output of `gmx genconf -nbox` if already run; "
+                   "otherwise genconf is run for you")
+    p.add_argument("--gmx", default="gmx", help="GROMACS command (default: gmx)")
+    p.add_argument("--order", choices=["grouped", "copy"], default="grouped",
+                   help="grouped: each molecule type contiguous (default); copy: genconf order")
+    p.add_argument("-I", "--include", action="append", default=[],
+                   help="extra directory to search for #include files (repeatable)")
+    p.add_argument("--out-gro", required=True)
+    p.add_argument("--out-top", required=True)
+    p.add_argument("--out-ndx", help="tiled index file (required if --ndx is given)")
+    a = p.parse_args(argv)
+    if a.ndx and not a.out_ndx:
+        p.error("--out-ndx is required with --ndx")
+
+    ncopies = a.nbox[0] * a.nbox[1] * a.nbox[2]
+    orig = read_gro(a.gro)
+
+    if a.tiled_gro:
+        tiled = read_gro(a.tiled_gro)
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = os.path.join(tmp, "genconf.gro")
+            run_genconf(a.gmx, a.gro, a.nbox, raw)
+            tiled = read_gro(raw)
+
+    # genconf must have produced ncopies back-to-back copies of the original atom list.
+    n = orig.natoms
+    if tiled.natoms != ncopies * n:
+        sys.exit(f"error: tiled .gro has {tiled.natoms} atoms, expected {ncopies} x {n} = {ncopies * n}; "
+                 f"was it made with -nbox {' '.join(map(str, a.nbox))}?")
+    for c in range(ncopies):
+        for i in range(n):
+            if tiled.atomname(c * n + i) != orig.atomname(i) or tiled.resname(c * n + i) != orig.resname(i):
+                sys.exit(f"error: tiled atom {c * n + i + 1} is {tiled.resname(c * n + i)}/"
+                         f"{tiled.atomname(c * n + i)}, expected {orig.resname(i)}/{orig.atomname(i)} "
+                         f"(copy {c + 1}); the tiled file is not in genconf copy order")
+
+    head, entries, tail = split_top(a.top)
+    moltypes, unresolved = {}, set()
+    scan_moleculetypes(a.top, include_dirs(a.top, a.include), moltypes, set(), unresolved)
+    if unresolved:
+        print("note: could not open #include files (fine if they only hold force-field "
+              "parameters): " + ", ".join(sorted(unresolved)))
+    blocks = molecule_blocks(orig, entries, moltypes)
+
+    # new_index[c][i]: 0-based position in the output of original atom i in copy c
+    new_index = [[0] * n for _ in range(ncopies)]
+    order = []
+    breaks = set()
+    if a.order == "grouped":
+        for name, count, start, size in blocks:
+            for c in range(ncopies):
+                breaks.add(len(order))
+                for i in range(start, start + size):
+                    new_index[c][i] = len(order)
+                    order.append(c * n + i)
+        mol_lines = [(name, count * ncopies) for name, count, _, _ in blocks]
+    else:
+        for c in range(ncopies):
+            breaks.add(len(order))
+            for i in range(n):
+                new_index[c][i] = len(order)
+                order.append(c * n + i)
+        mol_lines = []
+        for _ in range(ncopies):
+            for name, count in entries:
+                if mol_lines and mol_lines[-1][0] == name:
+                    mol_lines[-1] = (name, mol_lines[-1][1] + count)
+                else:
+                    mol_lines.append((name, count))
+
+    nbox_txt = "x".join(map(str, a.nbox))
+    write_gro(a.out_gro, f"{orig.title.strip()} (tiled {nbox_txt})",
+              [tiled.atom_lines[k] for k in order], tiled.box_line, breaks)
+
+    width = max(len(nm) for nm, _ in mol_lines)
+    body = ["; Compound        #mols"] + [f"{nm:<{max(width, 16)}} {cnt:>8d}" for nm, cnt in mol_lines]
+    out_head = []
+    in_system = False
+    for raw in head:
+        m = DIRECTIVE.match(strip_comment(raw))
+        if m:
+            in_system = m.group(1).lower() == "system"
+            out_head.append(raw)
+        elif in_system and strip_comment(raw):
+            out_head.append(f"{raw.rstrip()} (tiled {nbox_txt})")
+            in_system = False
+        else:
+            out_head.append(raw)
+    with open(a.out_top, "w") as f:
+        f.write("\n".join(out_head + body + ([""] + tail if tail else [])) + "\n")
+
+    if a.ndx:
+        groups = []
+        for name, atoms in read_ndx(a.ndx):
+            bad = [x for x in atoms if not 1 <= x <= n]
+            if bad:
+                sys.exit(f"error: index group {name} has atom {bad[0]} outside 1..{n}")
+            groups.append((name, sorted(new_index[c][x - 1] + 1 for c in range(ncopies) for x in atoms)))
+        write_ndx(a.out_ndx, groups)
+
+    print(f"\ntiled {n} atoms x {ncopies} copies = {len(order)} atoms ({a.order} order)")
+    print(f"box: {orig.box_line.split()[:3]} -> {tiled.box_line.split()[:3]}")
+    print("[ molecules ]")
+    for nm, cnt in mol_lines:
+        print(f"  {nm:<{width}} {cnt}")
+    print(f"wrote {a.out_gro}, {a.out_top}" + (f", {a.out_ndx}" if a.ndx else ""))
+
+
+if __name__ == "__main__":
+    main()
