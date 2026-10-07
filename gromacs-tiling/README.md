@@ -1,6 +1,8 @@
 # Tiling a peptide/bilayer system 3×3 in GROMACS
 
-`gmx genconf -nbox 3 3 1` copies the **whole** system nine times, back to back:
+All GROMACS commands here run through **`gmx_mpi`**.
+
+`gmx_mpi genconf -nbox 3 3 1` copies the **whole** system nine times, back to back:
 
 ```
 [peptide, POPC…, ions, water]  [peptide, POPC…, ions, water]  … ×9
@@ -24,24 +26,51 @@ It only needs the Python standard library.
 
 ## Usage
 
-Tiling only:
+### Full pipeline (tile → EM → equilibration → production)
 
 ```bash
-python3 tile_system.py --gro step5_input.gro --top topol.top --ndx index.ndx \
-    --nbox 3 3 1 --out-gro tiled.gro --out-top tiled.top --out-ndx tiled.ndx
+bash run_tiled.sh
 ```
 
-* Write `--out-top` next to the original `topol.top`: `#include "toppar/..."` paths
-  are relative to the topology's location.
-* Already ran genconf? Pass its output with `--tiled-gro genconf_out.gro`.
-* Use `--gmx gmx_mpi` (or similar) if your GROMACS binary has another name.
+First the script asks for every path it needs. You can press Tab to complete paths:
+
+* **Inputs:** original `.gro`, `.top`, `.ndx` (optional, leave blank to skip),
+  the minimization `.mdp`, the number of equilibration steps and each one's `.mdp`,
+  and the production `.mdp`. Paths that don't exist are asked for again.
+* **Outputs:** tiled `.gro`, `.top`, `.ndx`, and an output name (no extension) for
+  the minimization, each equilibration step and the production run. Defaults are
+  shown in brackets. If a file already exists, it asks before overwriting.
+* An optional MPI launcher for `mdrun` (e.g. `mpirun -np 4`) and extra `mdrun`
+  flags (e.g. `-ntomp 8 -nb gpu`).
+
+Then it runs `gmx_mpi genconf`, `tile_system.py`, and `gmx_mpi grompp`/`gmx_mpi mdrun`
+for each step. It stops early if `gmx_mpi` isn't on `PATH`, so load your GROMACS module first.
+
+### Tiling only
+
+```bash
+python3 tile_system.py
+```
+
+It asks for the original `.gro`, `.top` and `.ndx`, and for an existing genconf output.
+Leave that blank and it runs `gmx_mpi genconf -nbox 3 3 1` itself. Then it asks for
+the output `.gro`, `.top` and `.ndx`.
+
+If you'd rather give paths as flags, it uses them and asks only for the rest
+(pass `''` to skip the index or genconf output without being asked):
+
+```bash
+python3 tile_system.py --gro step5_input.gro --top topol.top --ndx index.ndx --tiled-gro '' \
+    --out-gro tiled.gro --out-top tiled.top --out-ndx tiled.ndx
+```
+
+* The output topology can go in any directory. Relative `#include "toppar/..."`
+  lines are rewritten so they still point at the original files.
+* `--nbox NX NY NZ` changes the tiling (default `3 3 1`). `--order copy` keeps
+  genconf's atom order instead of grouping molecule types.
 * `-I DIR` adds search paths for `#include` files. If a moleculetype can't be found
   (such as water inside a force-field directory), the script assumes one residue per
   molecule and prints a note.
-
-The full pipeline (tile → EM → equilibration → production) is in `run_tiled.sh`. Edit
-the file names at the top (CHARMM-GUI names are the defaults) and run
-`bash run_tiled.sh`.
 
 ## Things to check in the simulation setup
 
@@ -57,7 +86,7 @@ the file names at the top (CHARMM-GUI names are the defaults) and run
   semi-isotropic pressure coupling need no changes. The box is 3× larger in x/y, so
   expect about 9× the cost per step. Consider rechecking `-ntomp`/`-ntmpi` or the GPU
   settings.
-* Custom groups you add later with `gmx make_ndx` should be made from `tiled.gro`.
+* Custom groups you add later with `gmx_mpi make_ndx` should be made from `tiled.gro`.
 
 ## Tests
 
@@ -65,7 +94,9 @@ the file names at the top (CHARMM-GUI names are the defaults) and run
 python3 -m unittest discover -s tests
 ```
 
-The tests use a fake `gmx genconf` that copies the whole system the same way
-GROMACS does. They check that the expanded `[ molecules ]` list matches the output
-`.gro` atom by atom in both orderings, that index groups cover all nine copies, and
-that a wrong `-nbox` is rejected.
+The tests put a fake `gmx_mpi` on `PATH`. Its `genconf` copies the whole system the
+same way GROMACS does, and its `grompp`/`mdrun` only create the files the next step
+needs. They check that the expanded `[ molecules ]` list matches the output `.gro`
+atom by atom in both orderings, that index groups cover all nine copies, and that a
+wrong `-nbox` is rejected. They also feed answers to the prompts of both scripts
+and check that every GROMACS call is a `gmx_mpi` call with the paths that were entered.

@@ -1,7 +1,8 @@
 """Tests for tile_system.py on a small synthetic peptide/bilayer/water system.
 
-A fake `gmx` that implements `genconf -nbox` the way GROMACS does (whole-system copies
-back to back, shifted by the box vectors) stands in for GROMACS.
+A fake `gmx_mpi` on PATH stands in for GROMACS: `genconf -nbox` works the way GROMACS
+does (whole-system copies back to back, shifted by the box vectors); `grompp` and
+`mdrun` only create the files the pipeline needs next. Every call is logged.
 Run with:  python3 -m unittest discover -s tests
 """
 
@@ -14,10 +15,25 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..", "tile_system.py")
+PIPELINE = os.path.join(HERE, "..", "run_tiled.sh")
 
 FAKE_GMX = r'''#!/usr/bin/env python3
-import sys
+import os, shutil, sys
 args = sys.argv[1:]
+with open(os.environ["FAKE_GMX_LOG"], "a") as log:
+    log.write(" ".join(["gmx_mpi"] + args) + "\n")
+if args[0] == "grompp":
+    c = args[args.index("-c") + 1]
+    for flag in ("-f", "-c", "-p", "-n", "-r", "-t"):
+        if flag in args:
+            assert os.path.isfile(args[args.index(flag) + 1]), args
+    shutil.copy(c, args[args.index("-o") + 1])  # stand-in .tpr carries the coordinates
+    sys.exit(0)
+if args[0] == "mdrun":
+    name = args[args.index("-deffnm") + 1]
+    shutil.copy(name + ".tpr", name + ".gro")
+    open(name + ".cpt", "w").close()
+    sys.exit(0)
 assert args[0] == "genconf"
 f = args[args.index("-f") + 1]; o = args[args.index("-o") + 1]
 i = args.index("-nbox"); nx, ny, nz = map(int, args[i + 1:i + 4])
@@ -65,9 +81,12 @@ class TileTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         d = self.d = self.tmp.name
         os.makedirs(os.path.join(d, "toppar"))
-        with open(os.path.join(d, "gmx"), "w") as f:
+        os.makedirs(os.path.join(d, "bin"))
+        with open(os.path.join(d, "bin", "gmx_mpi"), "w") as f:
             f.write(FAKE_GMX)
-        os.chmod(os.path.join(d, "gmx"), 0o755)
+        os.chmod(os.path.join(d, "bin", "gmx_mpi"), 0o755)
+        self.env = dict(os.environ, PATH=os.path.join(d, "bin") + os.pathsep + os.environ["PATH"],
+                        FAKE_GMX_LOG=os.path.join(d, "gmx.log"))
         with open(os.path.join(d, "toppar", "PROA.itp"), "w") as f:
             f.write(itp("PROA", PROA))
         with open(os.path.join(d, "toppar", "POPC.itp"), "w") as f:
@@ -107,12 +126,16 @@ class TileTest(unittest.TestCase):
 
     def run_tool(self, order):
         d = self.d
-        subprocess.run([sys.executable, TOOL, "--gmx", os.path.join(d, "gmx"),
+        subprocess.run([sys.executable, TOOL,
                         "--gro", os.path.join(d, "in.gro"), "--top", os.path.join(d, "topol.top"),
-                        "--ndx", os.path.join(d, "index.ndx"), "--nbox", "3", "3", "1",
+                        "--ndx", os.path.join(d, "index.ndx"), "--tiled-gro", "", "--nbox", "3", "3", "1",
                         "--order", order, "--out-gro", os.path.join(d, "out.gro"),
                         "--out-top", os.path.join(d, "out.top"), "--out-ndx", os.path.join(d, "out.ndx")],
-                       check=True, capture_output=True, text=True)
+                       check=True, capture_output=True, text=True, env=self.env)
+        return self.read_outputs()
+
+    def read_outputs(self):
+        d = self.d
         lines = read(os.path.join(d, "out.gro")).splitlines()
         n = int(lines[1])
         atoms = [(l[5:10].strip(), l[10:15].strip()) for l in lines[2:2 + n]]
@@ -162,14 +185,83 @@ class TileTest(unittest.TestCase):
 
     def test_rejects_wrong_nbox(self):
         d = self.d
-        subprocess.run([os.path.join(d, "gmx"), "genconf", "-f", os.path.join(d, "in.gro"),
-                        "-o", os.path.join(d, "t.gro"), "-nbox", "2", "2", "1"], check=True)
+        subprocess.run(["gmx_mpi", "genconf", "-f", os.path.join(d, "in.gro"),
+                        "-o", os.path.join(d, "t.gro"), "-nbox", "2", "2", "1"], check=True, env=self.env)
         r = subprocess.run([sys.executable, TOOL, "--gro", os.path.join(d, "in.gro"),
-                            "--top", os.path.join(d, "topol.top"), "--tiled-gro", os.path.join(d, "t.gro"),
+                            "--top", os.path.join(d, "topol.top"), "--ndx", "", "--tiled-gro", os.path.join(d, "t.gro"),
                             "--out-gro", os.path.join(d, "o.gro"), "--out-top", os.path.join(d, "o.top")],
-                           capture_output=True, text=True)
+                           input="", capture_output=True, text=True, env=self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("expected 9 x 21", r.stderr)
+
+
+    def test_genconf_uses_gmx_mpi(self):
+        self.run_tool("grouped")
+        log = read(os.path.join(self.d, "gmx.log")).splitlines()
+        self.assertEqual(len(log), 1)
+        self.assertTrue(log[0].startswith("gmx_mpi genconf -f "))
+        self.assertTrue(log[0].endswith("-nbox 3 3 1"))
+
+    def test_prompts_for_every_path(self):
+        d = self.d
+        os.makedirs(os.path.join(d, "run"))
+        answers = "\n".join([
+            "nope.gro",                         # missing file: asked again
+            os.path.join(d, "in.gro"),
+            os.path.join(d, "topol.top"),
+            os.path.join(d, "index.ndx"),
+            "",                                 # no genconf output yet: run gmx_mpi genconf
+            os.path.join(d, "run", "out.gro"),
+            os.path.join(d, "run", "out.top"),
+            os.path.join(d, "run", "out.ndx"),
+        ]) + "\n"
+        r = subprocess.run([sys.executable, TOOL], input=answers, check=True,
+                           capture_output=True, text=True, env=self.env)
+        for label in ("Original (untiled) coordinate file", "Original topology file",
+                      "Original index file", "Existing gmx_mpi genconf output",
+                      "Output tiled coordinate file", "Output tiled topology file",
+                      "Output tiled index file"):
+            self.assertIn(label, r.stdout)
+        self.assertIn("not found: nope.gro", r.stdout)
+        os.replace(os.path.join(d, "run", "out.gro"), os.path.join(d, "out.gro"))
+        os.replace(os.path.join(d, "run", "out.ndx"), os.path.join(d, "out.ndx"))
+        top = read(os.path.join(d, "run", "out.top"))
+        # topology written to another directory: local includes now point back to toppar/
+        self.assertIn('#include "../toppar/PROA.itp"', top)
+        self.assertIn('#include "missing_ff.ff/forcefield.itp"', top)
+        with open(os.path.join(d, "out.top"), "w") as f:
+            f.write(top)
+        _, atoms, _, mols, ndx = self.read_outputs()
+        self.assertEqual(mols, [("PROA", 9), ("POPC", 18), ("SOL", 27), ("CLA", 9)])
+        self.check_consistent(atoms, mols)
+        self.assertEqual(ndx["SOLU"], list(range(1, 46)))
+
+    def test_pipeline_script(self):
+        d = self.d
+        for mdp in ("em", "eq1", "eq2", "md"):
+            open(os.path.join(d, mdp + ".mdp"), "w").close()
+        answers = "\n".join([
+            "in.gro", "topol.top", "index.ndx", "em.mdp",
+            "2", "eq1.mdp", "eq2.mdp", "md.mdp",
+            "big.gro", "big.top", "big.ndx",
+            "", "", "", "",                     # step names: accept defaults
+            "", "",                             # no MPI launcher, no extra mdrun flags
+        ]) + "\n"
+        r = subprocess.run(["bash", PIPELINE], input=answers, cwd=d, capture_output=True,
+                           text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        log = read(os.path.join(d, "gmx.log")).splitlines()
+        self.assertTrue(all(l.startswith("gmx_mpi ") for l in log))
+        self.assertEqual([l.split()[1] for l in log],
+                         ["genconf"] + ["grompp", "mdrun"] * 4)
+        self.assertIn("gmx_mpi grompp -f em.mdp -c big.gro -r big.gro -p big.top -n big.ndx "
+                      "-o tiled_em.tpr", log)
+        self.assertIn("gmx_mpi grompp -f eq2.mdp -c tiled_eq1.gro -r tiled_em.gro -p big.top "
+                      "-n big.ndx -t tiled_eq1.cpt -o tiled_eq2.tpr", log)
+        self.assertIn("gmx_mpi grompp -f md.mdp -c tiled_eq2.gro -p big.top -n big.ndx "
+                      "-t tiled_eq2.cpt -o tiled_md.tpr", log)
+        self.assertIn("gmx_mpi mdrun -v -deffnm tiled_md", log)
+        self.assertEqual(int(read(os.path.join(d, "big.gro")).splitlines()[1]), 21 * 9)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Tile a GROMACS system with `gmx genconf -nbox` and rebuild the topology and index.
+"""Tile a GROMACS system with `gmx_mpi genconf -nbox` and rebuild the topology and index.
 
-`gmx genconf -nbox NX NY NZ` writes NX*NY*NZ back-to-back copies of the whole input
+`gmx_mpi genconf -nbox NX NY NZ` writes NX*NY*NZ back-to-back copies of the whole input
 system: [copy 1: peptide, lipids, water, ions][copy 2: peptide, lipids, ...] ...
 A topology whose [ molecules ] counts are simply multiplied by 9 does NOT match that
 atom order, and grompp will fail (or, worse, silently mis-assign parameters when atom
 names happen to line up). An index file from the original system only covers copy 1.
 
 This script:
-  1. runs `gmx genconf` (or takes an already tiled .gro),
+  1. runs `gmx_mpi genconf` (or takes an already tiled .gro),
   2. checks the tiled file is N exact copies of the original,
   3. writes the coordinates in the requested molecule order
        grouped (default): every [ molecules ] block gathered across copies, so each
@@ -17,16 +17,19 @@ This script:
   4. writes the topology with a matching [ molecules ] section,
   5. writes an index file where every original group covers all N copies.
 
+Every input and output path is asked for interactively; a path already given on the
+command line (e.g. --gro step5_input.gro) is used without asking.
 Only the Python standard library is needed.
 """
 
 import argparse
 import os
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
+
+GMX = "gmx_mpi"  # every GROMACS command is run through gmx_mpi
 
 # ----------------------------------------------------------------------------- gro
 
@@ -228,35 +231,116 @@ def write_ndx(path, groups):
             f.write("\n")
 
 
+# ----------------------------------------------------------------------------- prompts
+
+
+def enable_path_completion():
+    """Tab-complete file paths at the prompts (where readline is available)."""
+    try:
+        import glob
+        import readline
+    except ImportError:
+        return
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(lambda text, state: (glob.glob(os.path.expanduser(text) + "*") + [None])[state])
+    readline.parse_and_bind("tab: complete")
+
+
+def ask_path(label, default=None, must_exist=True, optional=False):
+    """Prompt until a usable path is entered. Blank returns the default (or None if optional)."""
+    hint = f" [{default}]" if default else (" (blank to skip)" if optional else "")
+    while True:
+        try:
+            answer = input(f"{label}{hint}: ").strip()
+        except EOFError:
+            sys.exit(f"\nerror: no answer for: {label}")
+        path = os.path.expanduser(answer) if answer else default
+        if not path:
+            if optional:
+                return None
+            print("  a path is required")
+            continue
+        if must_exist and not os.path.isfile(path):
+            print(f"  not found: {path}")
+            continue
+        if not must_exist:
+            parent = os.path.dirname(os.path.abspath(path))
+            if not os.path.isdir(parent):
+                print(f"  directory does not exist: {parent}")
+                continue
+            if os.path.exists(path):
+                try:
+                    ok = input(f"  {path} exists; overwrite? [y/N]: ").strip().lower()
+                except EOFError:
+                    ok = ""
+                if ok not in ("y", "yes"):
+                    continue
+        return path
+
+
+def fill_paths(a):
+    """Ask for every input/output path not given on the command line."""
+    enable_path_completion()
+    print("Enter the file paths (Tab completes paths).")
+    if not a.gro:
+        a.gro = ask_path("Original (untiled) coordinate file, .gro")
+    if not a.top:
+        a.top = ask_path("Original topology file, .top")
+    if a.ndx is None:
+        a.ndx = ask_path("Original index file, .ndx", optional=True) or ""
+    if a.tiled_gro is None:
+        a.tiled_gro = ask_path(f"Existing {GMX} genconf output, .gro (blank to run {GMX} genconf now)",
+                               optional=True) or ""
+    stem = os.path.splitext(os.path.basename(a.gro))[0]
+    if not a.out_gro:
+        a.out_gro = ask_path("Output tiled coordinate file, .gro", f"{stem}_tiled.gro", must_exist=False)
+    if not a.out_top:
+        a.out_top = ask_path("Output tiled topology file, .top", "topol_tiled.top", must_exist=False)
+    if a.ndx and not a.out_ndx:
+        a.out_ndx = ask_path("Output tiled index file, .ndx", "index_tiled.ndx", must_exist=False)
+
+
+def relocate_include(raw, src_dir, dst_dir):
+    """Rewrite a relative #include so it still resolves from the output topology's directory."""
+    m = INCLUDE.match(raw)
+    if not m or os.path.isabs(m.group(1)) or src_dir == dst_dir:
+        return raw
+    target = os.path.join(src_dir, m.group(1))
+    if not os.path.isfile(target):
+        return raw  # e.g. a force field found through GMXLIB; leave it to grompp
+    return raw.replace(m.group(1), os.path.relpath(target, dst_dir), 1)
+
+
 # ----------------------------------------------------------------------------- main
 
 
-def run_genconf(gmx, gro, nbox, out):
-    cmd = shlex.split(gmx) + ["genconf", "-f", gro, "-o", out, "-nbox"] + [str(n) for n in nbox]
+def run_genconf(gro, nbox, out):
+    cmd = [GMX, "genconf", "-f", gro, "-o", out, "-nbox"] + [str(n) for n in nbox]
     print("running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--gro", required=True, help="original (untiled) coordinates, .gro")
-    p.add_argument("--top", required=True, help="original topology, .top")
-    p.add_argument("--ndx", help="original index file (optional)")
+    p.add_argument("--gro", help="original (untiled) coordinates, .gro")
+    p.add_argument("--top", help="original topology, .top")
+    p.add_argument("--ndx", help="original index file; pass '' to go without one")
     p.add_argument("--nbox", nargs=3, type=int, default=[3, 3, 1], metavar=("NX", "NY", "NZ"),
                    help="number of copies in x y z (default: 3 3 1; do not tile a bilayer in z)")
-    p.add_argument("--tiled-gro", help="output of `gmx genconf -nbox` if already run; "
-                   "otherwise genconf is run for you")
-    p.add_argument("--gmx", default="gmx", help="GROMACS command (default: gmx)")
+    p.add_argument("--tiled-gro", help=f"output of `{GMX} genconf -nbox` if already run; "
+                   "pass '' to have genconf run for you")
     p.add_argument("--order", choices=["grouped", "copy"], default="grouped",
                    help="grouped: each molecule type contiguous (default); copy: genconf order")
     p.add_argument("-I", "--include", action="append", default=[],
                    help="extra directory to search for #include files (repeatable)")
-    p.add_argument("--out-gro", required=True)
-    p.add_argument("--out-top", required=True)
-    p.add_argument("--out-ndx", help="tiled index file (required if --ndx is given)")
+    p.add_argument("--out-gro", help="tiled coordinates to write, .gro")
+    p.add_argument("--out-top", help="tiled topology to write, .top")
+    p.add_argument("--out-ndx", help="tiled index file to write, .ndx")
     a = p.parse_args(argv)
-    if a.ndx and not a.out_ndx:
-        p.error("--out-ndx is required with --ndx")
+    fill_paths(a)
+    for path in filter(None, (a.gro, a.top, a.ndx, a.tiled_gro)):
+        if not os.path.isfile(path):
+            sys.exit(f"error: not found: {path}")
 
     ncopies = a.nbox[0] * a.nbox[1] * a.nbox[2]
     orig = read_gro(a.gro)
@@ -266,7 +350,7 @@ def main(argv=None):
     else:
         with tempfile.TemporaryDirectory() as tmp:
             raw = os.path.join(tmp, "genconf.gro")
-            run_genconf(a.gmx, a.gro, a.nbox, raw)
+            run_genconf(a.gro, a.nbox, raw)
             tiled = read_gro(raw)
 
     # genconf must have produced ncopies back-to-back copies of the original atom list.
@@ -283,7 +367,8 @@ def main(argv=None):
 
     head, entries, tail = split_top(a.top)
     moltypes, unresolved = {}, set()
-    scan_moleculetypes(a.top, include_dirs(a.top, a.include), moltypes, set(), unresolved)
+    dirs = include_dirs(a.top, a.include)
+    scan_moleculetypes(a.top, dirs, moltypes, set(), unresolved)
     if unresolved:
         print("note: could not open #include files (fine if they only hold force-field "
               "parameters): " + ", ".join(sorted(unresolved)))
@@ -323,7 +408,10 @@ def main(argv=None):
     body = ["; Compound        #mols"] + [f"{nm:<{max(width, 16)}} {cnt:>8d}" for nm, cnt in mol_lines]
     out_head = []
     in_system = False
+    src_dir = os.path.dirname(os.path.abspath(a.top))
+    dst_dir = os.path.dirname(os.path.abspath(a.out_top))
     for raw in head:
+        raw = relocate_include(raw, src_dir, dst_dir)
         m = DIRECTIVE.match(strip_comment(raw))
         if m:
             in_system = m.group(1).lower() == "system"
@@ -334,7 +422,9 @@ def main(argv=None):
         else:
             out_head.append(raw)
     with open(a.out_top, "w") as f:
-        f.write("\n".join(out_head + body + ([""] + tail if tail else [])) + "\n")
+        f.write("\n".join(out_head + body
+                           + ([""] + [relocate_include(t, src_dir, dst_dir) for t in tail]
+                              if tail else [])) + "\n")
 
     if a.ndx:
         groups = []
