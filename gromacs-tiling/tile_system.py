@@ -54,12 +54,24 @@ class Gro:
         return self.atom_lines[i][10:15].strip()
 
 
+def looks_like_pdb(path):
+    """True for PDB content: no atom count on line 2, but ATOM/HETATM/CRYST1 records."""
+    with open(path) as f:
+        lines = f.read().splitlines()
+    try:
+        int(lines[1].split()[0])
+        return False  # a .gro file
+    except (IndexError, ValueError):
+        return any(l.startswith(("ATOM  ", "HETATM", "CRYST1")) for l in lines)
+
+
 def read_gro(path):
     with open(path) as f:
         lines = f.read().splitlines()
-    if len(lines) < 3:
-        sys.exit(f"error: {path} is not a valid .gro file")
-    natoms = int(lines[1].split()[0])
+    try:
+        natoms = int(lines[1].split()[0])
+    except (IndexError, ValueError):
+        sys.exit(f"error: {path} is not a .gro file (line 2 must be the number of atoms)")
     if len(lines) < natoms + 3:
         sys.exit(f"error: {path} declares {natoms} atoms but is truncated")
     return Gro(lines[0], lines[2:2 + natoms], lines[2 + natoms])
@@ -283,7 +295,7 @@ def fill_paths(a):
     enable_path_completion()
     print("Enter the file paths (Tab completes paths).")
     if not a.gro:
-        a.gro = ask_path("Original (untiled) coordinate file, .gro")
+        a.gro = ask_path("Original (untiled) coordinate file, .gro or .pdb")
     if not a.top:
         a.top = ask_path("Original topology file, .top")
     if a.ndx is None:
@@ -314,15 +326,36 @@ def relocate_include(raw, src_dir, dst_dir):
 # ----------------------------------------------------------------------------- main
 
 
-def run_genconf(gro, nbox, out):
-    cmd = [GMX, "genconf", "-f", gro, "-o", out, "-nbox"] + [str(n) for n in nbox]
+def run_gmx(args):
+    cmd = [GMX] + args
     print("running:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        sys.exit(f"error: {GMX} not found on PATH (load your GROMACS module first)")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"error: {GMX} {args[0]} failed (exit code {e.returncode}); see its output above")
+
+
+def load_coords(path, tmp, tag):
+    """Read a .gro file; PDB content (whatever the extension) is converted with editconf.
+
+    Returns the coordinates and the path of a .gro file holding them.
+    """
+    if not looks_like_pdb(path):
+        return read_gro(path), path
+    print(f"note: {path} is in PDB format; converting it to .gro with {GMX} editconf")
+    pdb = os.path.join(tmp, f"{tag}.pdb")  # editconf picks the format from the extension
+    gro = os.path.join(tmp, f"{tag}.gro")
+    with open(path) as src, open(pdb, "w") as dst:
+        dst.write(src.read())
+    run_gmx(["editconf", "-f", pdb, "-o", gro])
+    return read_gro(gro), gro
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--gro", help="original (untiled) coordinates, .gro")
+    p.add_argument("--gro", help="original (untiled) coordinates, .gro (PDB is converted)")
     p.add_argument("--top", help="original topology, .top")
     p.add_argument("--ndx", help="original index file; pass '' to go without one")
     p.add_argument("--nbox", nargs=3, type=int, default=[3, 3, 1], metavar=("NX", "NY", "NZ"),
@@ -343,14 +376,17 @@ def main(argv=None):
             sys.exit(f"error: not found: {path}")
 
     ncopies = a.nbox[0] * a.nbox[1] * a.nbox[2]
-    orig = read_gro(a.gro)
-
-    if a.tiled_gro:
-        tiled = read_gro(a.tiled_gro)
-    else:
-        with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp:
+        orig, orig_gro = load_coords(a.gro, tmp, "original")
+        box = [float(x) for x in orig.box_line.split()[:3]]
+        if min(box) <= 0:
+            sys.exit(f"error: {a.gro} has no periodic box ({orig.box_line.strip()!r}); "
+                     "genconf needs the box to place the copies (for a PDB, add a CRYST1 line)")
+        if a.tiled_gro:
+            tiled, _ = load_coords(a.tiled_gro, tmp, "tiled")
+        else:
             raw = os.path.join(tmp, "genconf.gro")
-            run_genconf(a.gro, a.nbox, raw)
+            run_gmx(["genconf", "-f", orig_gro, "-o", raw, "-nbox"] + [str(n) for n in a.nbox])
             tiled = read_gro(raw)
 
     # genconf must have produced ncopies back-to-back copies of the original atom list.

@@ -32,8 +32,10 @@ python3 tile_system.py
 
 It asks for each file path in turn. You can press Tab to complete paths:
 
-* **Inputs:** the original `.gro`, `.top` and `.ndx` (optional, leave blank to skip),
-  and an existing `genconf` output. Leave that blank and it runs
+* **Inputs:** the original coordinates, `.top` and `.ndx` (optional, leave blank to
+  skip), and an existing `genconf` output. Coordinates can be `.gro` or PDB (e.g.
+  CHARMM-GUI's `step5_input.pdb`). PDB content is spotted whatever the file extension,
+  converted with `gmx_mpi editconf`, and the tiled output is always written as `.gro`. Leave that blank and it runs
   `gmx_mpi genconf -nbox 3 3 1` itself. Paths that don't exist are asked for again.
 * **Outputs:** the tiled `.gro`, `.top` and `.ndx`. Defaults are shown in brackets.
   If a file already exists, it asks before overwriting.
