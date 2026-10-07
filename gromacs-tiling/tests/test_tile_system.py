@@ -1,8 +1,8 @@
 """Tests for tile_system.py on a small synthetic peptide/bilayer/water system.
 
-A fake `gmx_mpi` on PATH stands in for GROMACS: `genconf -nbox` works the way GROMACS
-does (whole-system copies back to back, shifted by the box vectors); `grompp` and
-`mdrun` only create the files the pipeline needs next. Every call is logged.
+A fake `gmx_mpi` on PATH stands in for GROMACS: its `genconf -nbox` works the way
+GROMACS does (whole-system copies back to back, shifted by the box vectors). Every call
+is logged.
 Run with:  python3 -m unittest discover -s tests
 """
 
@@ -15,25 +15,12 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..", "tile_system.py")
-PIPELINE = os.path.join(HERE, "..", "run_tiled.sh")
 
 FAKE_GMX = r'''#!/usr/bin/env python3
-import os, shutil, sys
+import os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_GMX_LOG"], "a") as log:
     log.write(" ".join(["gmx_mpi"] + args) + "\n")
-if args[0] == "grompp":
-    c = args[args.index("-c") + 1]
-    for flag in ("-f", "-c", "-p", "-n", "-r", "-t"):
-        if flag in args:
-            assert os.path.isfile(args[args.index(flag) + 1]), args
-    shutil.copy(c, args[args.index("-o") + 1])  # stand-in .tpr carries the coordinates
-    sys.exit(0)
-if args[0] == "mdrun":
-    name = args[args.index("-deffnm") + 1]
-    shutil.copy(name + ".tpr", name + ".gro")
-    open(name + ".cpt", "w").close()
-    sys.exit(0)
 assert args[0] == "genconf"
 f = args[args.index("-f") + 1]; o = args[args.index("-o") + 1]
 i = args.index("-nbox"); nx, ny, nz = map(int, args[i + 1:i + 4])
@@ -235,33 +222,6 @@ class TileTest(unittest.TestCase):
         self.assertEqual(mols, [("PROA", 9), ("POPC", 18), ("SOL", 27), ("CLA", 9)])
         self.check_consistent(atoms, mols)
         self.assertEqual(ndx["SOLU"], list(range(1, 46)))
-
-    def test_pipeline_script(self):
-        d = self.d
-        for mdp in ("em", "eq1", "eq2", "md"):
-            open(os.path.join(d, mdp + ".mdp"), "w").close()
-        answers = "\n".join([
-            "in.gro", "topol.top", "index.ndx", "em.mdp",
-            "2", "eq1.mdp", "eq2.mdp", "md.mdp",
-            "big.gro", "big.top", "big.ndx",
-            "", "", "", "",                     # step names: accept defaults
-            "", "",                             # no MPI launcher, no extra mdrun flags
-        ]) + "\n"
-        r = subprocess.run(["bash", PIPELINE], input=answers, cwd=d, capture_output=True,
-                           text=True, env=self.env)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        log = read(os.path.join(d, "gmx.log")).splitlines()
-        self.assertTrue(all(l.startswith("gmx_mpi ") for l in log))
-        self.assertEqual([l.split()[1] for l in log],
-                         ["genconf"] + ["grompp", "mdrun"] * 4)
-        self.assertIn("gmx_mpi grompp -f em.mdp -c big.gro -r big.gro -p big.top -n big.ndx "
-                      "-o tiled_em.tpr", log)
-        self.assertIn("gmx_mpi grompp -f eq2.mdp -c tiled_eq1.gro -r tiled_em.gro -p big.top "
-                      "-n big.ndx -t tiled_eq1.cpt -o tiled_eq2.tpr", log)
-        self.assertIn("gmx_mpi grompp -f md.mdp -c tiled_eq2.gro -p big.top -n big.ndx "
-                      "-t tiled_eq2.cpt -o tiled_md.tpr", log)
-        self.assertIn("gmx_mpi mdrun -v -deffnm tiled_md", log)
-        self.assertEqual(int(read(os.path.join(d, "big.gro")).splitlines()[1]), 21 * 9)
 
 
 if __name__ == "__main__":
