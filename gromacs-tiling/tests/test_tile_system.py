@@ -130,7 +130,7 @@ class TileTest(unittest.TestCase):
         subprocess.run([sys.executable, TOOL,
                         "--gro", os.path.join(d, "in.gro"), "--top", os.path.join(d, "topol.top"),
                         "--ndx", os.path.join(d, "index.ndx"), "--tiled-gro", "", "--nbox", "3", "3", "1",
-                        "--order", order, "--out-gro", os.path.join(d, "out.gro"),
+                        "--order", order, "--out-dir", d, "--out-gro", "out.gro",
                         "--out-top", os.path.join(d, "out.top"), "--out-ndx", os.path.join(d, "out.ndx")],
                        check=True, capture_output=True, text=True, env=self.env)
         return self.read_outputs()
@@ -201,7 +201,7 @@ class TileTest(unittest.TestCase):
             open(os.path.join(d, "gmx.log"), "w").close()
             r = subprocess.run([sys.executable, TOOL, "--gro", os.path.join(d, name),
                                 "--top", os.path.join(d, "topol.top"), "--ndx", os.path.join(d, "index.ndx"),
-                                "--tiled-gro", "", "--out-gro", os.path.join(d, "out.gro"),
+                                "--tiled-gro", "", "--out-dir", d, "--out-gro", "out.gro",
                                 "--out-top", os.path.join(d, "out.top"), "--out-ndx", os.path.join(d, "out.ndx")],
                                input="", capture_output=True, text=True, env=self.env)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -220,7 +220,7 @@ class TileTest(unittest.TestCase):
             f.write("title\nnot a number\n1 2 3\n")
         r = subprocess.run([sys.executable, TOOL, "--gro", os.path.join(d, "junk.gro"),
                             "--top", os.path.join(d, "topol.top"), "--ndx", "", "--tiled-gro", "",
-                            "--out-gro", os.path.join(d, "o.gro"), "--out-top", os.path.join(d, "o.top")],
+                            "--out-dir", d, "--out-gro", "o.gro", "--out-top", "o.top"],
                            input="", capture_output=True, text=True, env=self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("is not a .gro file", r.stderr)
@@ -232,7 +232,7 @@ class TileTest(unittest.TestCase):
                         "-o", os.path.join(d, "t.gro"), "-nbox", "2", "2", "1"], check=True, env=self.env)
         r = subprocess.run([sys.executable, TOOL, "--gro", os.path.join(d, "in.gro"),
                             "--top", os.path.join(d, "topol.top"), "--ndx", "", "--tiled-gro", os.path.join(d, "t.gro"),
-                            "--out-gro", os.path.join(d, "o.gro"), "--out-top", os.path.join(d, "o.top")],
+                            "--out-dir", d, "--out-gro", "o.gro", "--out-top", "o.top"],
                            input="", capture_output=True, text=True, env=self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("expected 9 x 21", r.stderr)
@@ -247,30 +247,34 @@ class TileTest(unittest.TestCase):
 
     def test_prompts_for_every_path(self):
         d = self.d
-        os.makedirs(os.path.join(d, "run"))
+        run = os.path.join(d, "new", "run")             # does not exist yet
         answers = "\n".join([
             "nope.gro",                         # missing file: asked again
             os.path.join(d, "in.gro"),
             os.path.join(d, "topol.top"),
             os.path.join(d, "index.ndx"),
             "",                                 # no genconf output yet: run gmx_mpi genconf
-            os.path.join(d, "run", "out.gro"),
-            os.path.join(d, "run", "out.top"),
-            os.path.join(d, "run", "out.ndx"),
+            run,                                # output directory
+            "",                                 # yes, create it
+            "",                                 # accept default names: in_tiled.gro,
+            "big.top",                          #   big.top
+            "",                                 #   index_tiled.ndx
         ]) + "\n"
         r = subprocess.run([sys.executable, TOOL], input=answers, check=True,
                            capture_output=True, text=True, env=self.env)
         for label in ("Original (untiled) coordinate file", "Original topology file",
                       "Original index file", "Existing gmx_mpi genconf output",
-                      "Output tiled coordinate file", "Output tiled topology file",
-                      "Output tiled index file"):
+                      "Output directory for the generated files", "does not exist; create it?",
+                      "Output tiled coordinate file name", "Output tiled topology file name",
+                      "Output tiled index file name"):
             self.assertIn(label, r.stdout)
         self.assertIn("not found: nope.gro", r.stdout)
-        os.replace(os.path.join(d, "run", "out.gro"), os.path.join(d, "out.gro"))
-        os.replace(os.path.join(d, "run", "out.ndx"), os.path.join(d, "out.ndx"))
-        top = read(os.path.join(d, "run", "out.top"))
+        self.assertEqual(sorted(os.listdir(run)), ["big.top", "in_tiled.gro", "index_tiled.ndx"])
+        os.replace(os.path.join(run, "in_tiled.gro"), os.path.join(d, "out.gro"))
+        os.replace(os.path.join(run, "index_tiled.ndx"), os.path.join(d, "out.ndx"))
+        top = read(os.path.join(run, "big.top"))
         # topology written to another directory: local includes now point back to toppar/
-        self.assertIn('#include "../toppar/PROA.itp"', top)
+        self.assertIn('#include "../../toppar/PROA.itp"', top)
         self.assertIn('#include "missing_ff.ff/forcefield.itp"', top)
         with open(os.path.join(d, "out.top"), "w") as f:
             f.write(top)
@@ -278,6 +282,16 @@ class TileTest(unittest.TestCase):
         self.assertEqual(mols, [("PROA", 9), ("POPC", 18), ("SOL", 27), ("CLA", 9)])
         self.check_consistent(atoms, mols)
         self.assertEqual(ndx["SOLU"], list(range(1, 46)))
+
+    def test_out_dir_flag(self):
+        d = self.d
+        out = os.path.join(d, "flagdir")
+        subprocess.run([sys.executable, TOOL, "--gro", os.path.join(d, "in.gro"),
+                        "--top", os.path.join(d, "topol.top"), "--ndx", os.path.join(d, "index.ndx"),
+                        "--tiled-gro", "", "--out-dir", out, "--out-gro", "a.gro", "--out-top", "a.top",
+                        "--out-ndx", "a.ndx"], input="", check=True, capture_output=True, text=True,
+                       env=self.env)
+        self.assertEqual(sorted(os.listdir(out)), ["a.gro", "a.ndx", "a.top"])
 
 
 if __name__ == "__main__":

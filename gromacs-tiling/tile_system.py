@@ -258,15 +258,38 @@ def enable_path_completion():
     readline.parse_and_bind("tab: complete")
 
 
-def ask_path(label, default=None, must_exist=True, optional=False):
-    """Prompt until a usable path is entered. Blank returns the default (or None if optional)."""
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        sys.exit(f"\nerror: no answer for: {prompt.rstrip(': ')}")
+
+
+def ask_dir(label, default):
+    """Prompt for a directory; offer to create it if it does not exist yet."""
+    while True:
+        path = os.path.expanduser(ask(f"{label} [{default}]: ") or default)
+        if os.path.isdir(path):
+            return os.path.abspath(path)
+        if os.path.exists(path):
+            print(f"  not a directory: {path}")
+            continue
+        if ask(f"  {path} does not exist; create it? [Y/n]: ").lower() in ("", "y", "yes"):
+            os.makedirs(path)
+            return os.path.abspath(path)
+
+
+def ask_path(label, default=None, must_exist=True, optional=False, base=None):
+    """Prompt until a usable path is entered. Blank returns the default (or None if optional).
+
+    With base, a relative answer (or the default) is taken inside that directory.
+    """
     hint = f" [{default}]" if default else (" (blank to skip)" if optional else "")
     while True:
-        try:
-            answer = input(f"{label}{hint}: ").strip()
-        except EOFError:
-            sys.exit(f"\nerror: no answer for: {label}")
+        answer = ask(f"{label}{hint}: ")
         path = os.path.expanduser(answer) if answer else default
+        if path and base:
+            path = os.path.join(base, path)
         if not path:
             if optional:
                 return None
@@ -281,11 +304,7 @@ def ask_path(label, default=None, must_exist=True, optional=False):
                 print(f"  directory does not exist: {parent}")
                 continue
             if os.path.exists(path):
-                try:
-                    ok = input(f"  {path} exists; overwrite? [y/N]: ").strip().lower()
-                except EOFError:
-                    ok = ""
-                if ok not in ("y", "yes"):
+                if ask(f"  {path} exists; overwrite? [y/N]: ").lower() not in ("y", "yes"):
                     continue
         return path
 
@@ -303,13 +322,23 @@ def fill_paths(a):
     if a.tiled_gro is None:
         a.tiled_gro = ask_path(f"Existing {GMX} genconf output, .gro (blank to run {GMX} genconf now)",
                                optional=True) or ""
+    if not a.out_dir:
+        a.out_dir = ask_dir("Output directory for the generated files", os.getcwd())
+    os.makedirs(a.out_dir, exist_ok=True)
+    # output names given as flags are also taken relative to the output directory
+    for attr in ("out_gro", "out_top", "out_ndx"):
+        if getattr(a, attr):
+            setattr(a, attr, os.path.join(a.out_dir, os.path.expanduser(getattr(a, attr))))
     stem = os.path.splitext(os.path.basename(a.gro))[0]
     if not a.out_gro:
-        a.out_gro = ask_path("Output tiled coordinate file, .gro", f"{stem}_tiled.gro", must_exist=False)
+        a.out_gro = ask_path("Output tiled coordinate file name, .gro", f"{stem}_tiled.gro",
+                             must_exist=False, base=a.out_dir)
     if not a.out_top:
-        a.out_top = ask_path("Output tiled topology file, .top", "topol_tiled.top", must_exist=False)
+        a.out_top = ask_path("Output tiled topology file name, .top", "topol_tiled.top",
+                             must_exist=False, base=a.out_dir)
     if a.ndx and not a.out_ndx:
-        a.out_ndx = ask_path("Output tiled index file, .ndx", "index_tiled.ndx", must_exist=False)
+        a.out_ndx = ask_path("Output tiled index file name, .ndx", "index_tiled.ndx",
+                             must_exist=False, base=a.out_dir)
 
 
 def relocate_include(raw, src_dir, dst_dir):
@@ -366,9 +395,10 @@ def main(argv=None):
                    help="grouped: each molecule type contiguous (default); copy: genconf order")
     p.add_argument("-I", "--include", action="append", default=[],
                    help="extra directory to search for #include files (repeatable)")
-    p.add_argument("--out-gro", help="tiled coordinates to write, .gro")
-    p.add_argument("--out-top", help="tiled topology to write, .top")
-    p.add_argument("--out-ndx", help="tiled index file to write, .ndx")
+    p.add_argument("--out-dir", help="directory to write the generated files into (created if needed)")
+    p.add_argument("--out-gro", help="tiled coordinates to write, .gro (relative to --out-dir)")
+    p.add_argument("--out-top", help="tiled topology to write, .top (relative to --out-dir)")
+    p.add_argument("--out-ndx", help="tiled index file to write, .ndx (relative to --out-dir)")
     a = p.parse_args(argv)
     fill_paths(a)
     for path in filter(None, (a.gro, a.top, a.ndx, a.tiled_gro)):
@@ -476,7 +506,9 @@ def main(argv=None):
     print("[ molecules ]")
     for nm, cnt in mol_lines:
         print(f"  {nm:<{width}} {cnt}")
-    print(f"wrote {a.out_gro}, {a.out_top}" + (f", {a.out_ndx}" if a.ndx else ""))
+    print(f"wrote into {a.out_dir}:")
+    for path in filter(None, (a.out_gro, a.out_top, a.out_ndx if a.ndx else None)):
+        print(f"  {os.path.relpath(path, a.out_dir)}")
 
 
 if __name__ == "__main__":

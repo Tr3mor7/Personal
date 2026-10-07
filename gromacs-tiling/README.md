@@ -33,22 +33,26 @@ python3 tile_system.py
 It asks for each file path in turn. You can press Tab to complete paths:
 
 * **Inputs:** the original coordinates, `.top` and `.ndx` (optional, leave blank to
-  skip), and an existing `genconf` output. Coordinates can be `.gro` or PDB (e.g.
-  CHARMM-GUI's `step5_input.pdb`). PDB content is spotted whatever the file extension,
-  converted with `gmx_mpi editconf`, and the tiled output is always written as `.gro`. Leave that blank and it runs
+  skip), and an existing `genconf` output. Leave that blank and it runs
   `gmx_mpi genconf -nbox 3 3 1` itself. Paths that don't exist are asked for again.
-* **Outputs:** the tiled `.gro`, `.top` and `.ndx`. Defaults are shown in brackets.
-  If a file already exists, it asks before overwriting.
+  Coordinates can be `.gro` or PDB (e.g. CHARMM-GUI's `step5_input.pdb`). PDB content
+  is spotted whatever the file extension and converted with `gmx_mpi editconf`.
+* **Output directory:** where all generated files are written (default: the current
+  directory). If it doesn't exist, it offers to create it.
+* **Output file names:** the tiled `.gro`, `.top` and `.ndx`, written inside the output
+  directory. Defaults are shown in brackets. If a file already exists, it asks before
+  overwriting.
 
 If you'd rather give paths as flags, it uses them and asks only for the rest
 (pass `''` to skip the index or genconf output without being asked):
 
 ```bash
 python3 tile_system.py --gro step5_input.gro --top topol.top --ndx index.ndx --tiled-gro '' \
-    --out-gro tiled.gro --out-top tiled.top --out-ndx tiled.ndx
+    --out-dir Tiled_3x3 --out-gro tiled.gro --out-top tiled.top --out-ndx tiled.ndx
 ```
 
-* The output topology can go in any directory. Relative `#include "toppar/..."`
+* Output names are taken relative to `--out-dir`. The output topology can go in any
+  directory. Relative `#include "toppar/..."`
   lines are rewritten so they still point at the original files.
 * `--nbox NX NY NZ` changes the tiling (default `3 3 1`; don't tile a bilayer in z).
   `--order copy` keeps genconf's atom order instead of grouping molecule types.
@@ -71,7 +75,7 @@ python3 -m unittest discover -s tests
 ```
 
 The tests put a fake `gmx_mpi` on `PATH` whose `genconf` copies the whole system the
-same way GROMACS does. They check that the expanded `[ molecules ]` list matches the output `.gro`
-atom by atom in both orderings, that index groups cover all nine copies, and that a
+same way GROMACS does. They check that the expanded `[ molecules ]` list matches the
+output `.gro` atom by atom in both orderings, that index groups cover all nine copies, and that a
 wrong `-nbox` is rejected. They also feed answers to the prompts and
 check that `genconf` is run as `gmx_mpi`.
