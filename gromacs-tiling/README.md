@@ -79,3 +79,7 @@ same way GROMACS does. They check that the expanded `[ molecules ]` list matches
 output `.gro` atom by atom in both orderings, that index groups cover all nine copies, and that a
 wrong `-nbox` is rejected. They also feed answers to the prompts and
 check that `genconf` is run as `gmx_mpi`.
+
+## AI disclosure
+
+This code was written with Claude (Anthropic's AI assistant). The project and its design were directed and reviewed by Gurnoor Hayer.
