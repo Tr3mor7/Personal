@@ -1,0 +1,36 @@
+# Never commit recordings, reference photos or results.
+# Videos and images are only allowed inside demo/ (your own demo recording).
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.mpg
+*.mpeg
+*.wmv
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.gif
+!demo/*.mp4
+!demo/*.png
+!demo/*.jpg
+!demo/*.gif
+
+# results and EMG / study data
+*.xlsx
+*.xls
+*.csv
+*.mat
+*.c3d
+*.edf
+*.tdms
+
+# MATLAB / Octave clutter
+*.asv
+*.m~
+octave-workspace
+.tape_write_test_*.tmp
