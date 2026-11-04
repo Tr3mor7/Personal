@@ -108,5 +108,5 @@ synthetic peptide/bilayer/water system and put a fake `gmx_mpi` on `PATH` whose
 
 ## AI disclosure
 
-This code was written with Claude (Anthropic's AI assistant). The project and its
-design were directed and reviewed by Gurnoor Hayer.
+This code was written with the support of Claude Code (Anthropic's AI coding assistant).
+The project and its design were directed and reviewed by Gurnoor Hayer.

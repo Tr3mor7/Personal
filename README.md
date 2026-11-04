@@ -14,5 +14,6 @@ repository as is.
 
 ## AI disclosure
 
-The code in this repository was written with Claude (Anthropic's AI assistant).
-The projects and their design were directed and reviewed by me (Gurnoor Hayer).
+The code in this repository was written with the support of Claude Code
+(Anthropic's AI coding assistant). The projects and their design were directed
+and reviewed by me (Gurnoor Hayer).
