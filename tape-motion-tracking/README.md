@@ -134,6 +134,6 @@ named its columns `…Every30Frames…`.
 
 ## AI disclosure
 
-This code was revised with Claude (Anthropic's AI assistant), starting from
-scripts written by Gurnoor Hayer. The project and its design were directed
-and reviewed by Gurnoor Hayer.
+This code was written with the support of Claude Code (Anthropic's AI coding
+assistant), starting from scripts by Gurnoor Hayer. The project and its design
+were directed and reviewed by Gurnoor Hayer.
