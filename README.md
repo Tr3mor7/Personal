@@ -1,7 +1,5 @@
 # Personal
 
-Random stuff waiting to be made public.
-
 Each folder is a standalone project with its own README, tests and dependencies.
 No project imports or references another, so each one can be moved to its own
 repository as is.
