@@ -106,17 +106,6 @@ small orange distractor. It checks:
 
 It passes in GNU Octave 8.4.
 
-## Demo
-
-*Add your own demo here.* Record a short clip yourself: for example, move a
-piece of orange tape stuck on a ruler or a pen. Put the clip, its reference
-screenshot and a plot of the results in `demo/`. That's the only folder where
-`.gitignore` allows videos and images.
-
-> **Never commit participant videos, reference photos taken from them, or any
-> study or EMG data.** The `.gitignore` blocks video, image, Excel, CSV and
-> `.mat` files outside `demo/` to make that hard to do by accident.
-
 ## History
 
 This version merges three earlier scripts (`batch_orange_tape_motion_analysis_v2.m`,
