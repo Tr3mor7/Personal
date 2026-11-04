@@ -9,6 +9,7 @@ repository as is.
 | [`gromacs-tiling/`](gromacs-tiling/) | Tiles a peptide/bilayer GROMACS system (default 3×3) and rebuilds the topology and index to match |
 | [`martini3-backmap/`](martini3-backmap/) | Backmaps Martini 3 coarse-grained structures to all-atom resolution |
 | [`tape-motion-tracking/`](tape-motion-tracking/) | MATLAB batch video tracking of a coloured tape marker: displacement and rotation every N frames, to Excel |
+| [`drv2605l-haptic-lra-erm/`](drv2605l-haptic-lra-erm/) | Arduino/ESP32 haptic breathing pacer on a TI DRV2605L driver, with an LRA (closed loop) or ERM (open loop) motor |
 
 ## AI disclosure
 
